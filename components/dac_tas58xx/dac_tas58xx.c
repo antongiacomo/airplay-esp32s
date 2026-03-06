@@ -635,6 +635,14 @@ static const float eq_center_freq[TAS58XX_EQ_BANDS] = {
     800.0f, 1250.0f, 2000.0f, 3150.0f, 5000.0f, 8000.0f, 16000.0f,
 };
 
+/* Q values per band matching mrtoy-me/esphome-tas58xx reference */
+static const float eq_q[TAS58XX_EQ_BANDS] = {
+    2.0f, 2.0f, 1.5f, 1.5f, 1.0f, 1.0f, 0.9f, 0.9f,
+    0.8f, 0.8f, 0.7f, 0.7f, 0.6f, 0.6f, 0.5f,
+};
+
+#define EQ_SAMPLE_RATE 48000.0f
+
 /* 1.0 in 5.27 fixed-point (1 sign + 4 int + 27 frac = 32-bit) */
 #define FP_ONE 0x08000000
 
@@ -696,20 +704,44 @@ static esp_err_t write_biquad_coeff(uint8_t page, uint8_t reg_start,
 }
 
 /**
- * Write a single biquad's pre-computed 20-byte coefficient block to the
- * TAS5825M coefficient RAM.  The caller must already have selected the
- * correct book (0xAA); this function selects the page and writes the data.
+ * Compute peaking-EQ biquad coefficients (Audio EQ Cookbook).
+ *
+ * TI convention: H(z) = (b0 + b1*z^-1 + b2*z^-2) / (1 - a1*z^-1 - a2*z^-2)
+ * so stored a1/a2 are the negated textbook values.
+ *
+ * Writes 5 coefficients in 5.27 signed fixed-point into coeff_out[].
  */
-static esp_err_t write_biquad_raw(uint8_t page, uint8_t sub_addr,
-                                  const uint8_t data[EQ_COEFF_BYTES]) {
-  esp_err_t err;
-  err = tas58xx_write_reg(REG_PAGE_SEL, page);
-  if (err != ESP_OK) {
-    return err;
-  }
+static void calc_peaking_biquad(float fc, float gain_db, float q, float fs,
+                                int32_t coeff_out[5]) {
+  float w0 = 2.0f * (float)M_PI * fc / fs;
+  float A = powf(10.0f, gain_db / 40.0f);
+  float sinw = sinf(w0);
+  float cosw = cosf(w0);
+  float alpha = sinw / (2.0f * q);
 
-  return i2c_bus_write(tas58xx_device_handle, tas58xx_addr, sub_addr, data,
-                       EQ_COEFF_BYTES);
+  float b0 = 1.0f + alpha * A;
+  float b1 = -2.0f * cosw;
+  float b2 = 1.0f - alpha * A;
+  float a0 = 1.0f + alpha / A;
+  float a1_txt = -2.0f * cosw;
+  float a2_txt = 1.0f - alpha / A;
+
+  float inv_a0 = 1.0f / a0;
+  b0 *= inv_a0;
+  b1 *= inv_a0;
+  b2 *= inv_a0;
+
+  /* TI format: negate textbook a1/a2 */
+  float a1_ti = -a1_txt * inv_a0;
+  float a2_ti = -a2_txt * inv_a0;
+
+  /* Convert to 5.27 fixed-point */
+  const float scale = (float)(1 << 27);
+  coeff_out[0] = (int32_t)roundf(b0 * scale);
+  coeff_out[1] = (int32_t)roundf(b1 * scale);
+  coeff_out[2] = (int32_t)roundf(b2 * scale);
+  coeff_out[3] = (int32_t)roundf(a1_ti * scale);
+  coeff_out[4] = (int32_t)roundf(a2_ti * scale);
 }
 
 static esp_err_t write_dsp_coeff32(uint8_t page, uint8_t reg, int32_t val) {
@@ -980,15 +1012,17 @@ static esp_err_t ensure_custom_coeffs_mode(void) {
 }
 
 /**
- * Program one biquad on both channels using pre-computed 20-byte coefficient
- * blocks from dac_tas58xx_eq_data.h.
+ * Compute and program one biquad on both channels.
  *
  * Enters Book 0xAA, writes CH-L then CH-R, returns to Book 0 / Page 0.
  * Assumes the caller holds REG_LOCK.
  */
-static esp_err_t program_biquad_raw(int bq,
-                                    const uint8_t data[EQ_COEFF_BYTES]) {
+static esp_err_t program_biquad(int bq, float gain_db) {
   esp_err_t err;
+  int32_t coeff[5];
+
+  calc_peaking_biquad(eq_center_freq[bq], gain_db, eq_q[bq], EQ_SAMPLE_RATE,
+                      coeff);
 
   /* Ensure DSP has all signal-path defaults before using custom coefficients */
   err = ensure_custom_coeffs_mode();
@@ -1003,25 +1037,23 @@ static esp_err_t program_biquad_raw(int bq,
   }
 
   /* Channel 1 (Left) */
-  err =
-      write_biquad_raw(eq_left_addr[bq].page, eq_left_addr[bq].sub_addr, data);
+  err = write_biquad_coeff(eq_left_addr[bq].page, eq_left_addr[bq].sub_addr,
+                           coeff);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "EQ: CH1 BQ%d raw write failed: %s", bq,
-             esp_err_to_name(err));
+    ESP_LOGE(TAG, "EQ: CH1 BQ%d write failed: %s", bq, esp_err_to_name(err));
     goto out;
   }
 
   /* Channel 2 (Right) */
-  err = write_biquad_raw(eq_right_addr[bq].page, eq_right_addr[bq].sub_addr,
-                         data);
+  err = write_biquad_coeff(eq_right_addr[bq].page, eq_right_addr[bq].sub_addr,
+                           coeff);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "EQ: CH2 BQ%d raw write failed: %s", bq,
-             esp_err_to_name(err));
+    ESP_LOGE(TAG, "EQ: CH2 BQ%d write failed: %s", bq, esp_err_to_name(err));
     goto out;
   }
 
   ESP_LOGD(TAG,
-           "EQ: BQ%d raw write OK (L page=0x%02X:0x%02X, R page=0x%02X:0x%02X)",
+           "EQ: BQ%d write OK (L page=0x%02X:0x%02X, R page=0x%02X:0x%02X)",
            bq, eq_left_addr[bq].page, eq_left_addr[bq].sub_addr,
            eq_right_addr[bq].page, eq_right_addr[bq].sub_addr);
 
@@ -1078,21 +1110,19 @@ esp_err_t tas58xx_eq_set_band(int band, float gain_db) {
     return ESP_ERR_INVALID_ARG;
   }
 
-  /* Clamp gain to integer dB range of pre-computed table */
-  int gain_int = (int)roundf(gain_db);
-  if (gain_int > TAS58XX_EQ_MAX_GAIN_DB) {
-    gain_int = (int)TAS58XX_EQ_MAX_GAIN_DB;
+  /* Clamp gain to ±15 dB range */
+  if (gain_db > TAS58XX_EQ_MAX_GAIN_DB) {
+    gain_db = TAS58XX_EQ_MAX_GAIN_DB;
   }
-  if (gain_int < TAS58XX_EQ_MIN_GAIN_DB) {
-    gain_int = (int)TAS58XX_EQ_MIN_GAIN_DB;
+  if (gain_db < TAS58XX_EQ_MIN_GAIN_DB) {
+    gain_db = TAS58XX_EQ_MIN_GAIN_DB;
   }
 
-  int idx = gain_int + EQ_GAIN_OFFSET;
-  ESP_LOGD(TAG, "EQ: band %d (%.0f Hz) -> %+d dB (table idx %d)", band,
-           eq_center_freq[band], gain_int, idx);
+  ESP_LOGD(TAG, "EQ: band %d (%.0f Hz) -> %+.1f dB", band,
+           eq_center_freq[band], gain_db);
 
   REG_LOCK();
-  esp_err_t err = program_biquad_raw(band, eq_coeff_table[idx][band].bytes);
+  esp_err_t err = program_biquad(band, gain_db);
   REG_UNLOCK();
   return err;
 }
@@ -1113,16 +1143,15 @@ esp_err_t tas58xx_eq_set_all(const float gains_db[TAS58XX_EQ_BANDS]) {
 
   esp_err_t first_err = ESP_OK;
   for (int i = 0; i < TAS58XX_EQ_BANDS; i++) {
-    int gain_int = (int)roundf(gains_db[i]);
-    if (gain_int > (int)TAS58XX_EQ_MAX_GAIN_DB) {
-      gain_int = (int)TAS58XX_EQ_MAX_GAIN_DB;
+    float gain = gains_db[i];
+    if (gain > TAS58XX_EQ_MAX_GAIN_DB) {
+      gain = TAS58XX_EQ_MAX_GAIN_DB;
     }
-    if (gain_int < (int)TAS58XX_EQ_MIN_GAIN_DB) {
-      gain_int = (int)TAS58XX_EQ_MIN_GAIN_DB;
+    if (gain < TAS58XX_EQ_MIN_GAIN_DB) {
+      gain = TAS58XX_EQ_MIN_GAIN_DB;
     }
 
-    int idx = gain_int + EQ_GAIN_OFFSET;
-    esp_err_t err = program_biquad_raw(i, eq_coeff_table[idx][i].bytes);
+    esp_err_t err = program_biquad(i, gain);
     if (err != ESP_OK && first_err == ESP_OK) {
       first_err = err;
     }
@@ -1138,9 +1167,6 @@ esp_err_t tas58xx_eq_set_all(const float gains_db[TAS58XX_EQ_BANDS]) {
 esp_err_t tas58xx_eq_flat(void) {
   ESP_LOGD(TAG, "EQ: resetting all bands to flat");
 
-  /* Index for 0 dB gain = unity passthrough */
-  const int flat_idx = EQ_GAIN_OFFSET;
-
   REG_LOCK();
 
   /* Mute during bulk update */
@@ -1152,7 +1178,7 @@ esp_err_t tas58xx_eq_flat(void) {
 
   esp_err_t first_err = ESP_OK;
   for (int i = 0; i < TAS58XX_EQ_BANDS; i++) {
-    esp_err_t err = program_biquad_raw(i, eq_coeff_table[flat_idx][i].bytes);
+    esp_err_t err = program_biquad(i, 0.0f);
     if (err != ESP_OK && first_err == ESP_OK) {
       first_err = err;
     }
