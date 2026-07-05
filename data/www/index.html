@@ -66,7 +66,15 @@ input:focus{outline:none;border-color:#e94560}
 <div class='slider-row'><input type='range' id='led-brightness' min='0' max='255' value='128' oninput='document.getElementById("led-pct").textContent=Math.round(this.value/255*100)+"%"'>
 <span id='led-pct'>50%</span></div></div>
 <button class='btn btn-secondary' onclick='saveBrightness()'>Save Brightness</button>
-<div id='brightness-msg'></div></div>
+<div id='brightness-msg'></div>
+<div class='form-group' style='margin-top:18px'><label for='chan-mode'>Output Channel</label>
+<select id='chan-mode' onchange='saveChannel()'>
+<option value='0'>Stereo</option>
+<option value='1'>Left only</option>
+<option value='2'>Right only</option>
+<option value='3'>Mono (L+R)</option>
+</select></div>
+<div id='chan-msg'></div></div>
 <div class='card'><h2>Firmware Update</h2>
 <div class='file-row'><input type='file' id='fw-file' accept='.bin' style='display:none'>
 <button class='btn btn-secondary' onclick='document.getElementById("fw-file").click()'>Choose File</button>
@@ -126,6 +134,15 @@ async function saveBrightness(){
   try{var r=await fetch('/api/led/brightness',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({brightness:v})});
     var d=await r.json();if(d.success){msg('brightness-msg','Saved!','ok');}else{msg('brightness-msg',d.error,'err');}}
   catch(e){msg('brightness-msg','Error','err');console.error('saveBrightness failed',e);}}
+async function loadChannel(){
+  try{var r=await fetch('/api/audio/channel');var d=await r.json();
+    if(d.success){document.getElementById('chan-mode').value=String(d.mode);}}
+  catch(e){console.warn('Could not load channel mode',e);}}
+async function saveChannel(){
+  var v=Number.parseInt(document.getElementById('chan-mode').value,10);
+  try{var r=await fetch('/api/audio/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:v})});
+    var d=await r.json();if(d.success){msg('chan-msg','Saved!','ok');}else{msg('chan-msg',d.error,'err');}}
+  catch(e){msg('chan-msg','Error','err');console.error('saveChannel failed',e);}}
 async function saveName(){
   var n=document.getElementById('dev-name').value.trim();if(!n){msg('name-msg','Enter a name','err');return;}
   try{var r=await fetch('/api/device/name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});
@@ -162,5 +179,5 @@ window.onload=function(){
   document.getElementById('fw-file').onchange=function(e){var f=e.target.files[0];
     document.getElementById('fw-name').textContent=f?f.name:'No file selected';
     document.getElementById('ota-btn').disabled=!f;};
-  loadInfo();loadBrightness();setInterval(loadInfo,30000);};
+  loadInfo();loadBrightness();loadChannel();setInterval(loadInfo,30000);};
 </script></body></html>

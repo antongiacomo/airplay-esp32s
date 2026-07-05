@@ -6,12 +6,14 @@
 
 /**
  * Output channel mode. LEFT/RIGHT route the chosen source channel to both
- * speakers; STEREO (default) plays the normal left/right mix.
+ * speakers; MONO plays the (L+R)/2 downmix on both speakers; STEREO (default)
+ * plays the normal left/right mix.
  */
 typedef enum {
   AUDIO_CHANNEL_STEREO = 0,
   AUDIO_CHANNEL_LEFT,
   AUDIO_CHANNEL_RIGHT,
+  AUDIO_CHANNEL_MONO,
 } audio_channel_mode_t;
 
 /**
@@ -72,10 +74,16 @@ void audio_output_set_source_rate(int rate);
 uint32_t audio_output_get_hardware_latency_us(void);
 
 /**
- * Cycle the output channel mode: STEREO -> LEFT -> RIGHT -> STEREO.
+ * Cycle the output channel mode: STEREO -> LEFT -> RIGHT -> MONO -> STEREO.
+ * The new mode is persisted to NVS.
  * @return the new mode after cycling.
  */
 audio_channel_mode_t audio_output_cycle_channel_mode(void);
+
+/**
+ * Set the output channel mode directly and persist it to NVS.
+ */
+void audio_output_set_channel_mode(audio_channel_mode_t mode);
 
 /**
  * Get the current output channel mode.

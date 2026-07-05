@@ -138,3 +138,18 @@ esp_err_t settings_clear_eq(void);
  * Check if EQ gains are saved.
  */
 bool settings_has_eq(void);
+
+// ---- Output channel mode ----
+
+/**
+ * Get saved output channel mode (audio_channel_mode_t value).
+ * @param mode Output: channel mode enum value
+ * @return ESP_OK if found, error otherwise
+ */
+esp_err_t settings_get_channel_mode(uint8_t *mode);
+
+/**
+ * Save output channel mode to persistent storage.
+ * @param mode audio_channel_mode_t value
+ */
+esp_err_t settings_set_channel_mode(uint8_t mode);

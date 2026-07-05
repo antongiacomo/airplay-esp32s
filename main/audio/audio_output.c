@@ -4,6 +4,7 @@
 #include "audio_resample.h"
 #include "dac.h"
 #include "led.h"
+#include "settings.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 #include "esp_check.h"
@@ -65,10 +66,19 @@ static void apply_volume(int16_t *buf, size_t n) {
 
 // Apply the selected channel mode to an interleaved stereo buffer (L,R,...).
 // LEFT/RIGHT route the chosen source channel to BOTH outputs so the selected
-// track is heard from both speakers; STEREO leaves the buffer untouched.
+// track is heard from both speakers; MONO plays the (L+R)/2 downmix on both
+// outputs; STEREO leaves the buffer untouched.
 static void apply_channel_mode(int16_t *buf, size_t frames) {
   audio_channel_mode_t mode = channel_mode;
   if (mode == AUDIO_CHANNEL_STEREO) {
+    return;
+  }
+  if (mode == AUDIO_CHANNEL_MONO) {
+    for (size_t i = 0; i < frames; i++) {
+      int16_t m = (int16_t)(((int32_t)buf[i * 2] + buf[i * 2 + 1]) / 2);
+      buf[i * 2] = m;
+      buf[i * 2 + 1] = m;
+    }
     return;
   }
   size_t src = (mode == AUDIO_CHANNEL_RIGHT) ? 1 : 0;
@@ -139,6 +149,13 @@ static void playback_task(void *arg) {
 }
 
 esp_err_t audio_output_init(void) {
+  uint8_t saved_mode;
+  if (settings_get_channel_mode(&saved_mode) == ESP_OK &&
+      saved_mode <= AUDIO_CHANNEL_MONO) {
+    channel_mode = (audio_channel_mode_t)saved_mode;
+    ESP_LOGI(TAG, "Loaded channel mode: %d", saved_mode);
+  }
+
   i2s_chan_config_t chan_cfg =
       I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   chan_cfg.dma_desc_num = I2S_DMA_DESC_NUM;
@@ -256,16 +273,28 @@ audio_channel_mode_t audio_output_cycle_channel_mode(void) {
   case AUDIO_CHANNEL_LEFT:
     next = AUDIO_CHANNEL_RIGHT;
     break;
+  case AUDIO_CHANNEL_RIGHT:
+    next = AUDIO_CHANNEL_MONO;
+    break;
   default:
     next = AUDIO_CHANNEL_STEREO;
     break;
   }
-  channel_mode = next;
-  ESP_LOGI(TAG, "Channel mode: %s",
-           next == AUDIO_CHANNEL_LEFT    ? "LEFT only"
-           : next == AUDIO_CHANNEL_RIGHT ? "RIGHT only"
-                                         : "STEREO");
+  audio_output_set_channel_mode(next);
   return next;
+}
+
+void audio_output_set_channel_mode(audio_channel_mode_t mode) {
+  if (mode > AUDIO_CHANNEL_MONO) {
+    mode = AUDIO_CHANNEL_STEREO;
+  }
+  channel_mode = mode;
+  settings_set_channel_mode((uint8_t)mode);
+  ESP_LOGI(TAG, "Channel mode: %s",
+           mode == AUDIO_CHANNEL_LEFT    ? "LEFT only"
+           : mode == AUDIO_CHANNEL_RIGHT ? "RIGHT only"
+           : mode == AUDIO_CHANNEL_MONO  ? "MONO (L+R)"
+                                         : "STEREO");
 }
 
 audio_channel_mode_t audio_output_get_channel_mode(void) {

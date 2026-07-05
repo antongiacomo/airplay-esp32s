@@ -19,6 +19,7 @@
 #include "ota.h"
 #include "log_stream.h"
 #include "rtsp_server.h"
+#include "audio_output.h"
 #include "esp_app_desc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -361,6 +362,53 @@ static esp_err_t led_brightness_post_handler(httpd_req_t *req) {
     cJSON_AddBoolToObject(response, "success", false);
     cJSON_AddStringToObject(response, "error",
                             "Expected {\"brightness\": 0-255}");
+  }
+
+  char *json_str = cJSON_Print(response);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  cJSON_Delete(response);
+  return ESP_OK;
+}
+
+static esp_err_t channel_mode_get_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddNumberToObject(json, "mode", audio_output_get_channel_mode());
+  cJSON_AddBoolToObject(json, "success", true);
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+static esp_err_t channel_mode_post_handler(httpd_req_t *req) {
+  char content[64];
+  int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+  if (ret <= 0) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+  content[ret] = '\0';
+
+  cJSON *json = cJSON_Parse(content);
+  if (!json) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    return ESP_FAIL;
+  }
+
+  cJSON *response = cJSON_CreateObject();
+  cJSON *val = cJSON_GetObjectItem(json, "mode");
+  if (val && cJSON_IsNumber(val) && val->valuedouble >= AUDIO_CHANNEL_STEREO &&
+      val->valuedouble <= AUDIO_CHANNEL_MONO) {
+    audio_output_set_channel_mode((audio_channel_mode_t)val->valuedouble);
+    cJSON_AddBoolToObject(response, "success", true);
+  } else {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Expected {\"mode\": 0-3}");
   }
 
   char *json_str = cJSON_Print(response);
@@ -766,7 +814,7 @@ esp_err_t web_server_start(uint16_t port) {
 #endif
   config.lru_purge_enable = true; // Reclaim stale sockets when all are in use
   config.max_uri_handlers =
-      28; // Room for captive portal + EQ + speedtest + brightness
+      30; // Room for captive portal + EQ + speedtest + brightness + channel
   config.max_resp_headers = 8;
   config.stack_size = 8192;
 
@@ -834,6 +882,16 @@ esp_err_t web_server_start(uint16_t port) {
                                          .handler =
                                              led_brightness_post_handler};
   httpd_register_uri_handler(s_server, &led_brightness_post_uri);
+
+  httpd_uri_t channel_mode_get_uri = {.uri = "/api/audio/channel",
+                                      .method = HTTP_GET,
+                                      .handler = channel_mode_get_handler};
+  httpd_register_uri_handler(s_server, &channel_mode_get_uri);
+
+  httpd_uri_t channel_mode_post_uri = {.uri = "/api/audio/channel",
+                                       .method = HTTP_POST,
+                                       .handler = channel_mode_post_handler};
+  httpd_register_uri_handler(s_server, &channel_mode_post_uri);
 
   httpd_uri_t ota_uri = {.uri = "/api/ota/update",
                          .method = HTTP_POST,
