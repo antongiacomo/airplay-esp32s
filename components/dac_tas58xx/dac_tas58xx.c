@@ -87,6 +87,12 @@
 #define CTRL2_HIZ        0x02
 #define CTRL2_PLAY       0x03
 
+/* ---------- DEVICE_CTRL1 (0x02) bit fields ---------- */
+// Modulation mode (bits 0-1) and switching freq (bits 4-6) live here too;
+// use read-modify-write so those defaults are preserved.
+#define CTRL1_PBTL_EN     (1 << 2) // Parallel bridge-tied load (mono)
+#define CTRL1_PBTL_CH_SEL (1 << 1) // PBTL data source: 0 = left, 1 = right
+
 /* ---------- DIG_VOL (0x4C) ---------- */
 // 0x00 = +24.0 dB, 0x30 = 0.0 dB, 0xFE = -103.0 dB, 0xFF = mute
 // step = -0.5 dB per increment
@@ -223,11 +229,42 @@ static const struct tas58xx_cmd_s tas5805m_init_seq[] = {
 };
 
 /* ---------- State ---------- */
-static uint8_t tas58xx_addr;
-static tas58xx_model_t tas58xx_model = TAS58XX_MODEL_UNKNOWN;
+
+/* Maximum number of TAS58xx chips managed on the shared I2C bus.
+ * Dual-DAC boards (e.g. Esparagus Audio Brick Dual) place a second
+ * TAS5825M on the same bus at a different address for a 2.1 setup. Extra
+ * chips are detected at runtime; boards with a single DAC simply report
+ * one device. */
+#define TAS58XX_MAX_DEVICES 2
+
+/* Per-chip state. All chips share the same I2S stream and I2C bus. */
+typedef struct {
+  uint8_t addr;                   /* 7-bit I2C address */
+  tas58xx_model_t model;          /* TAS5805M / TAS5825M */
+  i2c_master_dev_handle_t handle; /* I2C device handle */
+  bool dsp_defaults_written;      /* signal-path coeffs programmed */
+  bool pbtl_mono;                 /* configured as PBTL mono subwoofer */
+} tas58xx_dev_t;
+
+static tas58xx_dev_t s_devs[TAS58XX_MAX_DEVICES];
+static int s_dev_count = 0;
 static i2c_master_bus_handle_t s_bus_handle = NULL;
-static i2c_master_dev_handle_t tas58xx_device_handle;
-static bool s_dsp_defaults_written = false;
+
+/* Sub level trim (dB) added to the master volume for sub devices, and the
+ * cached master AirPlay volume so the trim can be re-applied on its own. */
+static float s_sub_offset_db = 0.0f;
+static float s_last_airplay_db = -15.0f;
+
+/*
+ * Device currently targeted by the low-level register helpers.
+ *
+ * All register access is serialized by s_reg_mutex, so a single
+ * "current device" pointer, set while the lock is held, is sufficient to
+ * route the page/book helpers and I2C read/write helpers to the correct
+ * chip. Entry points (ops + public EQ API) set s_cur under the lock for
+ * each device they touch.
+ */
+static tas58xx_dev_t *s_cur = NULL;
 
 /**
  * Mutex protecting all TAS5825M register access.
@@ -239,7 +276,8 @@ static bool s_dsp_defaults_written = false;
  * writing the target register will corrupt the operation.
  *
  * All functions that touch the I2C bus MUST hold this mutex. Public API
- * functions acquire it; internal helpers assume it's already held.
+ * functions acquire it; internal helpers assume it's already held. The
+ * lock also guards s_cur, which selects the target chip.
  */
 static SemaphoreHandle_t s_reg_mutex = NULL;
 
@@ -249,10 +287,19 @@ static SemaphoreHandle_t s_reg_mutex = NULL;
 /* ---------- Forward declarations ---------- */
 static esp_err_t tas58xx_write_reg(uint8_t reg, uint8_t value);
 static esp_err_t tas58xx_read_reg(uint8_t reg, uint8_t *value);
+static esp_err_t tas58xx_init_one(tas58xx_dev_t *dev);
+static esp_err_t tas58xx_apply_pbtl_mono(void);
 
 /* ---------- Detect ---------- */
 
-static uint8_t tas58xx_detect(i2c_master_bus_handle_t bus) {
+/*
+ * Probe the bus for every supported TAS58xx address and record each chip
+ * found (up to TAS58XX_MAX_DEVICES) into s_devs[]. Devices are recorded
+ * in ascending-address order; the caller assigns roles based on index.
+ *
+ * Returns the number of devices detected.
+ */
+static int tas58xx_detect(i2c_master_bus_handle_t bus) {
   static const struct {
     uint8_t addr;
     tas58xx_model_t model;
@@ -273,15 +320,22 @@ static uint8_t tas58xx_detect(i2c_master_bus_handle_t bus) {
     return 0;
   }
 
-  for (int i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+  int found = 0;
+  for (int i = 0; i < sizeof(candidates) / sizeof(candidates[0]) &&
+                  found < TAS58XX_MAX_DEVICES;
+       i++) {
     if (ESP_OK == i2c_master_probe(bus, candidates[i].addr, I2C_TIMEOUT)) {
       ESP_LOGI(TAG, "Detected %s at @0x%02X", candidates[i].name,
                candidates[i].addr);
-      tas58xx_model = candidates[i].model;
-      return candidates[i].addr;
+      s_devs[found].addr = candidates[i].addr;
+      s_devs[found].model = candidates[i].model;
+      s_devs[found].handle = NULL;
+      s_devs[found].dsp_defaults_written = false;
+      s_devs[found].pbtl_mono = false;
+      found++;
     }
   }
-  return 0;
+  return found;
 }
 
 /* ---------- DAC ops implementation ---------- */
@@ -289,7 +343,8 @@ static uint8_t tas58xx_detect(i2c_master_bus_handle_t bus) {
 static void tas58xx_dump_status(const char *context) {
   uint8_t val = 0;
 
-  ESP_LOGD(TAG, "--- %s: TAS5825M status dump ---", context);
+  ESP_LOGD(TAG, "--- %s: TAS58xx @0x%02X status dump ---", context,
+           s_cur ? s_cur->addr : 0);
 
   if (tas58xx_read_reg(REG_DEVICE_CTRL2, &val) == ESP_OK) {
     const char *state_str;
@@ -487,6 +542,98 @@ static void tas58xx_dump_status(const char *context) {
   ESP_LOGD(TAG, "--- end status dump ---");
 }
 
+/*
+ * Initialize a single TAS58xx chip: add it to the I2C bus, verify its die
+ * ID, run the model-specific register init sequence, and (for the sub)
+ * enable PBTL mono output. Assumes REG_LOCK is held; sets s_cur to dev.
+ */
+static esp_err_t tas58xx_init_one(tas58xx_dev_t *dev) {
+  esp_err_t err;
+
+  s_cur = dev;
+
+  err = board_i2c_add_device(s_bus_handle, dev->addr, I2C_LINE_SPEED,
+                             &dev->handle);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Could not add @0x%02X to I2C bus: %s", dev->addr,
+             esp_err_to_name(err));
+    return err;
+  }
+
+  // Verify die ID
+  uint8_t die_id = 0;
+  err = tas58xx_read_reg(REG_DIE_ID, &die_id);
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG, "@0x%02X Die ID: 0x%02X %s", dev->addr, die_id,
+             (die_id == TAS5825M_DIE_ID)   ? "(TAS5825M)"
+             : (die_id == TAS5805M_DIE_ID) ? "(TAS5805M)"
+                                           : "(UNEXPECTED!)");
+  } else {
+    ESP_LOGE(TAG, "@0x%02X Failed to read die ID: %s", dev->addr,
+             esp_err_to_name(err));
+  }
+
+  // Run the model-specific init sequence
+  const struct tas58xx_cmd_s *seq = (dev->model == TAS58XX_MODEL_TAS5825M)
+                                        ? tas5825m_init_seq
+                                        : tas5805m_init_seq;
+
+  ESP_LOGI(TAG, "@0x%02X running init sequence (%s)...", dev->addr,
+           dev->pbtl_mono ? "PBTL mono sub" : "stereo");
+  for (int i = 0; seq[i].reg != 0xFF; i++) {
+    err = tas58xx_write_reg(seq[i].reg, seq[i].value);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Init failed at step %d: reg 0x%02X val 0x%02X: %s", i,
+               seq[i].reg, seq[i].value, esp_err_to_name(err));
+      return err;
+    }
+    ESP_LOGD(TAG, "  [%02d] reg 0x%02X <- 0x%02X", i, seq[i].reg, seq[i].value);
+
+    // Pause after HiZ transition to let clocks settle
+    if (seq[i].reg == REG_DEVICE_CTRL2 &&
+        (seq[i].value & CTRL2_STATE_MASK) == CTRL2_HIZ) {
+      ESP_LOGD(TAG, "  Waiting 10 ms for HiZ clock settle");
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    // Pause after DSP configuration before going to PLAY
+    if (seq[i].reg == REG_DSP_CTRL) {
+      ESP_LOGD(TAG, "  Waiting 5 ms for DSP settle");
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+
+  /*
+   * Configure the PBTL (mono) output stage for the subwoofer chip while
+   * still in HiZ. PBTL is a control-port setting (DEVICE_CTRL1 bit 2) and
+   * must be established before the output stage drives the paralleled
+   * load. The L+R summing (mono mixer) is a DSP-coefficient change applied
+   * once the device reaches PLAY (see tas58xx_apply_pbtl_mono()).
+   */
+  if (dev->pbtl_mono) {
+    uint8_t ctrl1 = 0;
+    tas58xx_read_reg(REG_DEVICE_CTRL1, &ctrl1);
+    ctrl1 |= CTRL1_PBTL_EN;
+    err = tas58xx_write_reg(REG_DEVICE_CTRL1, ctrl1);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "@0x%02X failed to enable PBTL: %s", dev->addr,
+               esp_err_to_name(err));
+      return err;
+    }
+    ESP_LOGI(TAG, "@0x%02X PBTL mono mode enabled (DEVICE_CTRL1=0x%02X)",
+             dev->addr, ctrl1);
+  }
+
+  // Give the device time to settle
+  vTaskDelay(pdMS_TO_TICKS(10));
+
+  tas58xx_dump_status("post-init");
+
+  ESP_LOGI(TAG, "%s @0x%02X initialized",
+           dev->model == TAS58XX_MODEL_TAS5805M ? "TAS5805M" : "TAS5825M",
+           dev->addr);
+  return ESP_OK;
+}
+
 static esp_err_t tas58xx_init(void *i2c_bus) {
   esp_err_t err;
 
@@ -506,101 +653,70 @@ static esp_err_t tas58xx_init(void *i2c_bus) {
     return ESP_ERR_INVALID_ARG;
   }
 
-  // Detect device
-  tas58xx_model = TAS58XX_MODEL_UNKNOWN;
-  tas58xx_addr = tas58xx_detect(s_bus_handle);
-  if (!tas58xx_addr) {
+  // Detect all chips on the bus (up to TAS58XX_MAX_DEVICES)
+  s_dev_count = tas58xx_detect(s_bus_handle);
+  if (s_dev_count == 0) {
     ESP_LOGE(TAG, "No TAS5825M/TAS5805M detected on I2C bus!");
     return ESP_ERR_NOT_FOUND;
   }
 
-  err = board_i2c_add_device(s_bus_handle, tas58xx_addr, I2C_LINE_SPEED,
-                             &tas58xx_device_handle);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Could not add device to I2C bus: %s", esp_err_to_name(err));
-    return err;
+  /*
+   * Role assignment: the first detected chip drives the stereo
+   * satellites; any additional chip is configured as a mono subwoofer in
+   * PBTL (parallel bridge-tied load) mode. Both chips share the same I2S
+   * stream, so the sub sums L+R itself via its input mixer.
+   */
+  for (int i = 1; i < s_dev_count; i++) {
+    s_devs[i].pbtl_mono = true;
   }
 
-  // Verify die ID
-  uint8_t die_id = 0;
-  err = tas58xx_read_reg(REG_DIE_ID, &die_id);
-  if (err == ESP_OK) {
-    ESP_LOGI(TAG, "Die ID: 0x%02X %s", die_id,
-             (die_id == TAS5825M_DIE_ID)   ? "(TAS5825M)"
-             : (die_id == TAS5805M_DIE_ID) ? "(TAS5805M)"
-                                           : "(UNEXPECTED!)");
-  } else {
-    ESP_LOGE(TAG, "Failed to read die ID: %s", esp_err_to_name(err));
-  }
+  ESP_LOGI(TAG, "Detected %d TAS58xx device(s)", s_dev_count);
 
-  if (tas58xx_model == TAS58XX_MODEL_UNKNOWN) {
-    ESP_LOGE(TAG, "Unknown TAS58XX model detected — aborting init");
-    return ESP_ERR_NOT_FOUND;
-  }
-
-  // Run init sequence
-  const struct tas58xx_cmd_s *tas58xx_init_seq =
-      (tas58xx_model == TAS58XX_MODEL_TAS5825M) ? tas5825m_init_seq
-                                                : tas5805m_init_seq;
-
-  ESP_LOGI(TAG, "Running init sequence...");
-  for (int i = 0; tas58xx_init_seq[i].reg != 0xFF; i++) {
-    err = tas58xx_write_reg(tas58xx_init_seq[i].reg, tas58xx_init_seq[i].value);
+  REG_LOCK();
+  for (int i = 0; i < s_dev_count; i++) {
+    err = tas58xx_init_one(&s_devs[i]);
     if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Init failed at step %d: reg 0x%02X val 0x%02X: %s", i,
-               tas58xx_init_seq[i].reg, tas58xx_init_seq[i].value,
-               esp_err_to_name(err));
+      REG_UNLOCK();
       return err;
     }
-    ESP_LOGD(TAG, "  [%02d] reg 0x%02X <- 0x%02X", i, tas58xx_init_seq[i].reg,
-             tas58xx_init_seq[i].value);
-
-    // Pause after HiZ transition to let clocks settle
-    if (tas58xx_init_seq[i].reg == REG_DEVICE_CTRL2 &&
-        (tas58xx_init_seq[i].value & CTRL2_STATE_MASK) == CTRL2_HIZ) {
-      ESP_LOGD(TAG, "  Waiting 10 ms for HiZ clock settle");
-      vTaskDelay(pdMS_TO_TICKS(10));
-    }
-
-    // Pause after DSP configuration before going to PLAY
-    if (tas58xx_init_seq[i].reg == REG_DSP_CTRL) {
-      ESP_LOGD(TAG, "  Waiting 5 ms for DSP settle");
-      vTaskDelay(pdMS_TO_TICKS(5));
-    }
   }
+  REG_UNLOCK();
 
-  // Give the device time to reach PLAY state
-  vTaskDelay(pdMS_TO_TICKS(10));
-
-  // Dump full status after init
-  tas58xx_dump_status("post-init");
-
-  ESP_LOGI(TAG, "%s initialized at I2C addr 0x%02X",
-           tas58xx_model == TAS58XX_MODEL_TAS5805M ? "TAS5805M" : "TAS5825M",
-           tas58xx_addr);
   return ESP_OK;
 }
 
 static esp_err_t tas58xx_deinit(void) {
   esp_err_t err = ESP_OK;
 
-  // Put device into deep sleep
-  tas58xx_write_reg(REG_DEVICE_CTRL2, CTRL2_DEEP_SLEEP);
-
-  if (tas58xx_device_handle) {
-    err = board_i2c_remove_device(tas58xx_device_handle);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed to remove from I2C bus: %s", esp_err_to_name(err));
+  REG_LOCK();
+  for (int i = 0; i < s_dev_count; i++) {
+    tas58xx_dev_t *dev = &s_devs[i];
+    if (!dev->handle) {
+      continue;
     }
-    tas58xx_device_handle = NULL;
+    s_cur = dev;
+    // Put device into deep sleep
+    tas58xx_write_reg(REG_DEVICE_CTRL2, CTRL2_DEEP_SLEEP);
+
+    esp_err_t e = board_i2c_remove_device(dev->handle);
+    if (e != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to remove @0x%02X from I2C bus: %s", dev->addr,
+               esp_err_to_name(e));
+      err = e;
+    }
+    dev->handle = NULL;
   }
+  s_cur = NULL;
+  s_dev_count = 0;
+  REG_UNLOCK();
 
   s_bus_handle = NULL;
   return err;
 }
 
-static void tas58xx_set_power_mode(dac_power_mode_t mode) {
-  REG_LOCK();
+/* Apply a power mode to a single chip. Assumes REG_LOCK is held. */
+static void set_power_mode_dev(tas58xx_dev_t *dev, dac_power_mode_t mode) {
+  s_cur = dev;
   uint8_t cur_ctrl2 = 0;
   tas58xx_read_reg(REG_DEVICE_CTRL2, &cur_ctrl2);
   uint8_t cur_state = cur_ctrl2 & CTRL2_STATE_MASK;
@@ -636,7 +752,7 @@ static void tas58xx_set_power_mode(dac_power_mode_t mode) {
 
       /* Coefficient RAM may be invalid after DEEP_SLEEP — force
        * full re-write of signal-path defaults on next EQ update. */
-      s_dsp_defaults_written = false;
+      dev->dsp_defaults_written = false;
     }
 
     // Clear any faults accumulated while clocks were absent
@@ -668,6 +784,12 @@ static void tas58xx_set_power_mode(dac_power_mode_t mode) {
     // Clear any faults from PLAY transition
     tas58xx_write_reg(REG_FAULT_CLEAR, 0x80);
 
+    // Re-apply the L+R mono mix for a PBTL subwoofer once the DSP is
+    // running (coefficient RAM writes require active I2S clocks).
+    if (dev->pbtl_mono) {
+      tas58xx_apply_pbtl_mono();
+    }
+
     tas58xx_dump_status("power-on");
   } else if (mode == DAC_POWER_STANDBY) {
     tas58xx_write_reg(REG_DEVICE_CTRL2, CTRL2_HIZ);
@@ -675,26 +797,34 @@ static void tas58xx_set_power_mode(dac_power_mode_t mode) {
     tas58xx_write_reg(REG_DEVICE_CTRL2, CTRL2_DEEP_SLEEP);
     /* DEEP_SLEEP may reset registers and coefficient RAM — ensure
      * full re-initialization happens on the next wake-up. */
-    s_dsp_defaults_written = false;
+    dev->dsp_defaults_written = false;
   }
+}
 
+/* Fan a power-mode change out to every managed chip. */
+static void tas58xx_set_power_mode(dac_power_mode_t mode) {
+  REG_LOCK();
+  for (int i = 0; i < s_dev_count; i++) {
+    set_power_mode_dev(&s_devs[i], mode);
+  }
+  s_cur = NULL;
   REG_UNLOCK();
 }
 
-static void tas58xx_enable_speaker(bool enable) {
-  REG_LOCK();
+/* Enable/disable (mute) output on a single chip. Assumes REG_LOCK held. */
+static void enable_speaker_dev(tas58xx_dev_t *dev, bool enable) {
+  s_cur = dev;
 
   // Use mute bit in DEVICE_CTRL2 to enable/disable output.
   // Read current register, modify mute bit, write back.
   uint8_t val;
   esp_err_t err = tas58xx_read_reg(REG_DEVICE_CTRL2, &val);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to read DEVICE_CTRL2");
-    REG_UNLOCK();
+    ESP_LOGE(TAG, "@0x%02X failed to read DEVICE_CTRL2", dev->addr);
     return;
   }
 
-  ESP_LOGI(TAG, "Speaker %s (DEVICE_CTRL2 was 0x%02X)",
+  ESP_LOGI(TAG, "@0x%02X speaker %s (DEVICE_CTRL2 was 0x%02X)", dev->addr,
            enable ? "ENABLE" : "DISABLE", val);
 
   if (enable) {
@@ -704,7 +834,14 @@ static void tas58xx_enable_speaker(bool enable) {
   }
 
   tas58xx_write_reg(REG_DEVICE_CTRL2, val);
+}
 
+static void tas58xx_enable_speaker(bool enable) {
+  REG_LOCK();
+  for (int i = 0; i < s_dev_count; i++) {
+    enable_speaker_dev(&s_devs[i], enable);
+  }
+  s_cur = NULL;
   REG_UNLOCK();
 }
 
@@ -713,10 +850,9 @@ static void tas58xx_enable_line_out(bool enable) {
   ESP_LOGW(TAG, "Line out not supported on TAS58XX");
 }
 
-static void tas58xx_set_volume(float volume_airplay_db) {
-  REG_LOCK();
-
-  // Clamp AirPlay input range (-30 to 0)
+// Map an AirPlay volume (-30..0 dB) to a TAS5825M DIG_VOL dB level
+// (+24..-103 dB), applying the 2:1 scaling and low-end roll-off.
+static float tas58xx_map_volume_db(float volume_airplay_db) {
   if (volume_airplay_db > 0.0f) {
     volume_airplay_db = 0.0f;
   }
@@ -724,13 +860,6 @@ static void tas58xx_set_volume(float volume_airplay_db) {
     volume_airplay_db = -30.0f;
   }
 
-  // TAS5825M DIG_VOL register:
-  //   0x00 = +24.0 dB
-  //   0x30 = 0.0 dB
-  //   0xFE = -103.0 dB
-  //   0xFF = mute
-  //   Step = -0.5 dB per count
-  //
   // Volume mapping (2:1 scaling):
   //   AirPlay 0 dB    -> DAC CONFIG_TAS58XX_MAX_VOLUME
   //   AirPlay -25 dB  -> DAC (MAX - 50)
@@ -755,29 +884,85 @@ static void tas58xx_set_volume(float volume_airplay_db) {
   if (db_level < -103.0f) {
     db_level = -103.0f;
   }
+  return db_level;
+}
 
-  // Convert dB to register value:
-  // reg = 0x30 - (db_level * 2)  (since 0x30 = 0 dB and step = -0.5 dB)
-  uint8_t reg_val;
+// Convert a TAS5825M DIG_VOL dB level to a register value.
+//   0x00 = +24.0 dB, 0x30 = 0.0 dB, 0xFE = -103.0 dB, 0xFF = mute
+//   Step = -0.5 dB per count.
+static uint8_t tas58xx_db_to_reg(float db_level) {
+  if (db_level > 24.0f) {
+    db_level = 24.0f;
+  }
   if (db_level <= -103.0f) {
-    reg_val = DIG_VOL_MUTE;
-  } else {
-    int raw = DIG_VOL_0DB - (int)(db_level * 2.0f);
-    if (raw < 0x00) {
-      raw = 0x00;
-    }
-    if (raw > 0xFE) {
-      raw = 0xFE;
-    }
-    reg_val = (uint8_t)raw;
+    return DIG_VOL_MUTE;
+  }
+  int raw = DIG_VOL_0DB - (int)(db_level * 2.0f);
+  if (raw < 0x00) {
+    raw = 0x00;
+  }
+  if (raw > 0xFE) {
+    raw = 0xFE;
+  }
+  return (uint8_t)raw;
+}
+
+// Re-apply the cached master volume to every chip, adding the sub level trim
+// to any sub (PBTL mono) device. Assumes REG_LOCK is held.
+static void tas58xx_apply_volume_locked(void) {
+  float base_db = tas58xx_map_volume_db(s_last_airplay_db);
+  uint8_t main_reg = tas58xx_db_to_reg(base_db);
+  uint8_t sub_reg = tas58xx_db_to_reg(base_db + s_sub_offset_db);
+
+  ESP_LOGD(TAG,
+           "Volume: AirPlay %.1f dB -> DAC %.1f dB (main 0x%02X, sub %+.1f dB "
+           "0x%02X)",
+           s_last_airplay_db, base_db, main_reg, s_sub_offset_db, sub_reg);
+
+  for (int i = 0; i < s_dev_count; i++) {
+    s_cur = &s_devs[i];
+    tas58xx_write_reg(REG_DIG_VOL, s_devs[i].pbtl_mono ? sub_reg : main_reg);
+  }
+  s_cur = NULL;
+}
+
+static void tas58xx_set_volume(float volume_airplay_db) {
+  REG_LOCK();
+  if (volume_airplay_db > 0.0f) {
+    volume_airplay_db = 0.0f;
+  }
+  if (volume_airplay_db < -30.0f) {
+    volume_airplay_db = -30.0f;
+  }
+  s_last_airplay_db = volume_airplay_db;
+  tas58xx_apply_volume_locked();
+  REG_UNLOCK();
+}
+
+void dac_tas58xx_set_sub_offset_db(float offset_db) {
+  if (offset_db > TAS58XX_SUB_OFFSET_MAX_DB) {
+    offset_db = TAS58XX_SUB_OFFSET_MAX_DB;
+  }
+  if (offset_db < TAS58XX_SUB_OFFSET_MIN_DB) {
+    offset_db = TAS58XX_SUB_OFFSET_MIN_DB;
   }
 
-  ESP_LOGD(TAG, "Volume: AirPlay %.1f dB -> DAC %.1f dB -> reg 0x%02X",
-           volume_airplay_db, db_level, reg_val);
+  // May be called (e.g. from the web server) before the DAC is initialised;
+  // store the value and let the next volume update apply it.
+  if (s_reg_mutex == NULL) {
+    s_sub_offset_db = offset_db;
+    return;
+  }
 
-  tas58xx_write_reg(REG_DIG_VOL, reg_val);
-
+  REG_LOCK();
+  s_sub_offset_db = offset_db;
+  tas58xx_apply_volume_locked();
   REG_UNLOCK();
+  ESP_LOGI(TAG, "Sub volume offset: %+.1f dB", offset_db);
+}
+
+float dac_tas58xx_get_sub_offset_db(void) {
+  return s_sub_offset_db;
 }
 
 /* ---------- Public ops struct ---------- */
@@ -794,11 +979,11 @@ const dac_ops_t dac_tas58xx_ops = {
 /* ---------- Register read/write helpers ---------- */
 
 static esp_err_t tas58xx_write_reg(uint8_t reg, uint8_t value) {
-  return board_i2c_write(tas58xx_device_handle, reg, &value, sizeof(uint8_t));
+  return board_i2c_write(s_cur->handle, reg, &value, sizeof(uint8_t));
 }
 
 static esp_err_t tas58xx_read_reg(uint8_t reg, uint8_t *value) {
-  return board_i2c_read(tas58xx_device_handle, reg, value, sizeof(uint8_t));
+  return board_i2c_read(s_cur->handle, reg, value, sizeof(uint8_t));
 }
 
 /* ==================  15-Band Parametric EQ  ================== */
@@ -876,7 +1061,7 @@ static esp_err_t write_biquad_coeff(uint8_t page, uint8_t reg_start,
     buf[i * 4 + 3] = (uint8_t)((coeff[i]) & 0xFF);
   }
 
-  return board_i2c_write(tas58xx_device_handle, reg_start, buf, BQ_COEFF_SIZE);
+  return board_i2c_write(s_cur->handle, reg_start, buf, BQ_COEFF_SIZE);
 }
 
 /**
@@ -892,7 +1077,7 @@ static esp_err_t write_biquad_raw(uint8_t page, uint8_t sub_addr,
     return err;
   }
 
-  return board_i2c_write(tas58xx_device_handle, sub_addr, data, EQ_COEFF_BYTES);
+  return board_i2c_write(s_cur->handle, sub_addr, data, EQ_COEFF_BYTES);
 }
 
 static esp_err_t write_dsp_coeff32(uint8_t page, uint8_t reg, int32_t val) {
@@ -902,7 +1087,7 @@ static esp_err_t write_dsp_coeff32(uint8_t page, uint8_t reg, int32_t val) {
   }
   uint8_t buf[4] = {(uint8_t)(val >> 24), (uint8_t)(val >> 16),
                     (uint8_t)(val >> 8), (uint8_t)(val)};
-  return board_i2c_write(tas58xx_device_handle, reg, buf, 4);
+  return board_i2c_write(s_cur->handle, reg, buf, 4);
 }
 
 /**
@@ -912,7 +1097,7 @@ static esp_err_t write_dsp_coeff32(uint8_t page, uint8_t reg, int32_t val) {
 static esp_err_t write_dsp_signal_path_defaults(void) {
   esp_err_t err = ESP_OK;
 
-  switch (tas58xx_model) {
+  switch (s_cur->model) {
   case TAS58XX_MODEL_TAS5805M: {
     ESP_LOGD(TAG, "DSP: writing signal-path defaults (Books 0x8C + 0xAA)");
 
@@ -944,7 +1129,7 @@ static esp_err_t write_dsp_signal_path_defaults(void) {
 
     err = select_default_page();
 
-    s_dsp_defaults_written = true;
+    s_cur->dsp_defaults_written = true;
     ESP_LOGD(TAG, "DSP: signal-path defaults written (Book 0x8C + 0xAA)");
   } break;
 
@@ -1134,13 +1319,13 @@ static esp_err_t write_dsp_signal_path_defaults(void) {
 
     err = select_default_page();
 
-    s_dsp_defaults_written = true;
+    s_cur->dsp_defaults_written = true;
     ESP_LOGD(TAG, "DSP: signal-path defaults written (Book 0x8C + 0xAA)");
   } break;
 
   default:
     ESP_LOGE(TAG, "Unknown TAS58XX model %d in write_dsp_signal_path_defaults",
-             tas58xx_model);
+             s_cur->model);
     return ESP_ERR_INVALID_STATE;
   }
 
@@ -1166,7 +1351,7 @@ static esp_err_t ensure_custom_coeffs_mode(void) {
     }
 
     /* Write all signal-path coefficients first */
-    if (!s_dsp_defaults_written) {
+    if (!s_cur->dsp_defaults_written) {
       err = write_dsp_signal_path_defaults();
       if (err != ESP_OK) {
         if (was_unmuted) {
@@ -1220,7 +1405,7 @@ static esp_err_t program_biquad_raw(int bq,
                                     const uint8_t data[EQ_COEFF_BYTES]) {
   esp_err_t err;
 
-  if (tas58xx_model == TAS58XX_MODEL_TAS5825M) {
+  if (s_cur->model == TAS58XX_MODEL_TAS5825M) {
     /* Ensure DSP has all signal-path defaults before using custom coefficients
      */
     err = ensure_custom_coeffs_mode();
@@ -1235,10 +1420,10 @@ static esp_err_t program_biquad_raw(int bq,
     goto out;
   }
 
-  const eq_bq_addr_t *eq_left_addr = (tas58xx_model == TAS58XX_MODEL_TAS5805M)
+  const eq_bq_addr_t *eq_left_addr = (s_cur->model == TAS58XX_MODEL_TAS5805M)
                                          ? tas5805m_eq_left_addr
                                          : tas5825m_eq_left_addr;
-  const eq_bq_addr_t *eq_right_addr = (tas58xx_model == TAS58XX_MODEL_TAS5805M)
+  const eq_bq_addr_t *eq_right_addr = (s_cur->model == TAS58XX_MODEL_TAS5805M)
                                           ? tas5805m_eq_right_addr
                                           : tas5825m_eq_right_addr;
 
@@ -1273,7 +1458,7 @@ out:
 static esp_err_t write_eq_mode(bool enable) {
   esp_err_t err;
 
-  switch (tas58xx_model) {
+  switch (s_cur->model) {
   case TAS58XX_MODEL_TAS5805M: {
     select_default_page();
 
@@ -1297,8 +1482,7 @@ static esp_err_t write_eq_mode(bool enable) {
         0x00, 0x00, 0x00, enable ? 0x00 : 0x01, /* bypass_eq */
     };
 
-    err = board_i2c_write(tas58xx_device_handle, EQ_MODE_REG, mode_data,
-                          EQ_MODE_SIZE);
+    err = board_i2c_write(s_cur->handle, EQ_MODE_REG, mode_data, EQ_MODE_SIZE);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "EQ: mode write failed: %s", esp_err_to_name(err));
     } else {
@@ -1309,31 +1493,117 @@ static esp_err_t write_eq_mode(bool enable) {
   } break;
 
   default:
-    ESP_LOGE(TAG, "Unknown TAS58XX model %d in write_eq_mode", tas58xx_model);
+    ESP_LOGE(TAG, "Unknown TAS58XX model %d in write_eq_mode", s_cur->model);
     return ESP_ERR_INVALID_STATE;
   }
 
   return err;
 }
 
+/*
+ * Configure the current chip (s_cur) to sum L+R into a mono channel for a
+ * PBTL subwoofer. Switches the DSP to custom-coefficient mode and overrides
+ * the input mixer so both output paths carry (L+R) at -6 dB. Assumes
+ * REG_LOCK is held and s_cur points at the sub chip; the chip must be in
+ * PLAY (coefficient RAM writes require active I2S clocks).
+ */
+static esp_err_t tas58xx_apply_pbtl_mono(void) {
+  if (s_cur->model != TAS58XX_MODEL_TAS5825M) {
+    ESP_LOGW(TAG,
+             "@0x%02X PBTL mono mixer only implemented for TAS5825M; "
+             "sub will play the left channel only",
+             s_cur->addr);
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+
+  /* Enter custom-coefficient mode (writes straight-stereo signal-path
+   * defaults, then clears USE_DEFAULT_COEFFS). */
+  esp_err_t err = ensure_custom_coeffs_mode();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "@0x%02X PBTL: failed to enter custom coeff mode: %s",
+             s_cur->addr, esp_err_to_name(err));
+    return err;
+  }
+
+  /*
+   * Override the input mixer (Book 0x8C, Page 0x0B) so that both output
+   * channels carry 0.5*L + 0.5*R. 0.5 == -6.02 dB == 0x00400000 in 9.23
+   * fixed point. In PBTL the paralleled output follows one channel, so
+   * summing into both makes the sub content independent of PBTL_CH_SEL.
+   */
+  static const int32_t HALF_9_23 = 0x00400000;
+  err = select_book_page(0x8C, 0x0B);
+  if (err != ESP_OK) {
+    select_default_page();
+    return err;
+  }
+  write_dsp_coeff32(0x0B, 0x14, HALF_9_23); /* L -> L */
+  write_dsp_coeff32(0x0B, 0x18, HALF_9_23); /* R -> L */
+  write_dsp_coeff32(0x0B, 0x1C, HALF_9_23); /* L -> R */
+  write_dsp_coeff32(0x0B, 0x20, HALF_9_23); /* R -> R */
+  err = select_default_page();
+
+  ESP_LOGI(TAG, "@0x%02X PBTL mono mixer applied (L+R -6 dB)", s_cur->addr);
+  return err;
+}
+
 /* ---------- Public API ---------- */
 
-esp_err_t tas58xx_eq_enable(bool enable) {
-  REG_LOCK();
-  esp_err_t err;
+/*
+ * The user-facing 15-band EQ is applied to the stereo satellite chip(s)
+ * only. The PBTL mono subwoofer is intentionally excluded — it keeps a flat
+ * response and its own L+R mono mixer.
+ */
 
-  if (tas58xx_model == TAS58XX_MODEL_TAS5825M) {
-    /* Ensure DSP defaults are written before touching EQ mode */
-    err = ensure_custom_coeffs_mode();
-    if (err != ESP_OK) {
-      REG_UNLOCK();
-      return err;
+/* Program a full set of per-band gain indices on the current chip (s_cur).
+ * Assumes REG_LOCK is held and s_cur is set. */
+static esp_err_t eq_program_indices_dev(const int idx[TAS58XX_EQ_BANDS]) {
+  /* Mute to prevent DSP glitches while bulk-updating coefficients */
+  uint8_t saved_ctrl2 = 0;
+  tas58xx_read_reg(REG_DEVICE_CTRL2, &saved_ctrl2);
+  if (!(saved_ctrl2 & CTRL2_MUTE)) {
+    tas58xx_write_reg(REG_DEVICE_CTRL2, saved_ctrl2 | CTRL2_MUTE);
+  }
+
+  esp_err_t first_err = ESP_OK;
+  for (int i = 0; i < TAS58XX_EQ_BANDS; i++) {
+    esp_err_t err = program_biquad_raw(i, eq_coeff_table[idx[i]][i].bytes);
+    if (err != ESP_OK && first_err == ESP_OK) {
+      first_err = err;
     }
   }
 
-  err = write_eq_mode(enable);
+  /* Restore original mute state */
+  tas58xx_write_reg(REG_DEVICE_CTRL2, saved_ctrl2);
+  return first_err;
+}
+
+esp_err_t tas58xx_eq_enable(bool enable) {
+  REG_LOCK();
+  esp_err_t first_err = ESP_OK;
+
+  for (int d = 0; d < s_dev_count; d++) {
+    if (s_devs[d].pbtl_mono) {
+      continue;
+    }
+    s_cur = &s_devs[d];
+
+    esp_err_t err = ESP_OK;
+    if (s_cur->model == TAS58XX_MODEL_TAS5825M) {
+      /* Ensure DSP defaults are written before touching EQ mode */
+      err = ensure_custom_coeffs_mode();
+    }
+    if (err == ESP_OK) {
+      err = write_eq_mode(enable);
+    }
+    if (err != ESP_OK && first_err == ESP_OK) {
+      first_err = err;
+    }
+  }
+
+  s_cur = NULL;
   REG_UNLOCK();
-  return err;
+  return first_err;
 }
 
 esp_err_t tas58xx_eq_set_band(int band, float gain_db) {
@@ -1356,9 +1626,20 @@ esp_err_t tas58xx_eq_set_band(int band, float gain_db) {
            eq_center_freq[band], gain_int, idx);
 
   REG_LOCK();
-  esp_err_t err = program_biquad_raw(band, eq_coeff_table[idx][band].bytes);
+  esp_err_t first_err = ESP_OK;
+  for (int d = 0; d < s_dev_count; d++) {
+    if (s_devs[d].pbtl_mono) {
+      continue;
+    }
+    s_cur = &s_devs[d];
+    esp_err_t err = program_biquad_raw(band, eq_coeff_table[idx][band].bytes);
+    if (err != ESP_OK && first_err == ESP_OK) {
+      first_err = err;
+    }
+  }
+  s_cur = NULL;
   REG_UNLOCK();
-  return err;
+  return first_err;
 }
 
 esp_err_t tas58xx_eq_set_all(const float gains_db[TAS58XX_EQ_BANDS]) {
@@ -1366,16 +1647,7 @@ esp_err_t tas58xx_eq_set_all(const float gains_db[TAS58XX_EQ_BANDS]) {
     return ESP_ERR_INVALID_ARG;
   }
 
-  REG_LOCK();
-
-  /* Mute to prevent DSP glitches while bulk-updating coefficients */
-  uint8_t saved_ctrl2 = 0;
-  tas58xx_read_reg(REG_DEVICE_CTRL2, &saved_ctrl2);
-  if (!(saved_ctrl2 & CTRL2_MUTE)) {
-    tas58xx_write_reg(REG_DEVICE_CTRL2, saved_ctrl2 | CTRL2_MUTE);
-  }
-
-  esp_err_t first_err = ESP_OK;
+  int idx[TAS58XX_EQ_BANDS];
   for (int i = 0; i < TAS58XX_EQ_BANDS; i++) {
     int gain_int = (int)roundf(gains_db[i]);
     if (gain_int > (int)TAS58XX_EQ_MAX_GAIN_DB) {
@@ -1384,17 +1656,22 @@ esp_err_t tas58xx_eq_set_all(const float gains_db[TAS58XX_EQ_BANDS]) {
     if (gain_int < (int)TAS58XX_EQ_MIN_GAIN_DB) {
       gain_int = (int)TAS58XX_EQ_MIN_GAIN_DB;
     }
+    idx[i] = gain_int + EQ_GAIN_OFFSET;
+  }
 
-    int idx = gain_int + EQ_GAIN_OFFSET;
-    esp_err_t err = program_biquad_raw(i, eq_coeff_table[idx][i].bytes);
+  REG_LOCK();
+  esp_err_t first_err = ESP_OK;
+  for (int d = 0; d < s_dev_count; d++) {
+    if (s_devs[d].pbtl_mono) {
+      continue;
+    }
+    s_cur = &s_devs[d];
+    esp_err_t err = eq_program_indices_dev(idx);
     if (err != ESP_OK && first_err == ESP_OK) {
       first_err = err;
     }
   }
-
-  /* Restore original mute state */
-  tas58xx_write_reg(REG_DEVICE_CTRL2, saved_ctrl2);
-
+  s_cur = NULL;
   REG_UNLOCK();
   return first_err;
 }
@@ -1403,33 +1680,30 @@ esp_err_t tas58xx_eq_flat(void) {
   ESP_LOGD(TAG, "EQ: resetting all bands to flat");
 
   /* Index for 0 dB gain = unity passthrough */
-  const int flat_idx = EQ_GAIN_OFFSET;
-
-  REG_LOCK();
-
-  /* Mute during bulk update */
-  uint8_t saved_ctrl2 = 0;
-  tas58xx_read_reg(REG_DEVICE_CTRL2, &saved_ctrl2);
-  if (!(saved_ctrl2 & CTRL2_MUTE)) {
-    tas58xx_write_reg(REG_DEVICE_CTRL2, saved_ctrl2 | CTRL2_MUTE);
+  int idx[TAS58XX_EQ_BANDS];
+  for (int i = 0; i < TAS58XX_EQ_BANDS; i++) {
+    idx[i] = EQ_GAIN_OFFSET;
   }
 
+  REG_LOCK();
   esp_err_t first_err = ESP_OK;
-  for (int i = 0; i < TAS58XX_EQ_BANDS; i++) {
-    esp_err_t err = program_biquad_raw(i, eq_coeff_table[flat_idx][i].bytes);
+  for (int d = 0; d < s_dev_count; d++) {
+    if (s_devs[d].pbtl_mono) {
+      continue;
+    }
+    s_cur = &s_devs[d];
+
+    esp_err_t err = eq_program_indices_dev(idx);
+
+    /* Enable EQ after programming flat coefficients */
+    if (err == ESP_OK) {
+      err = write_eq_mode(true);
+    }
     if (err != ESP_OK && first_err == ESP_OK) {
       first_err = err;
     }
   }
-
-  /* Enable EQ after programming flat coefficients */
-  if (first_err == ESP_OK) {
-    first_err = write_eq_mode(true);
-  }
-
-  /* Restore original mute state */
-  tas58xx_write_reg(REG_DEVICE_CTRL2, saved_ctrl2);
-
+  s_cur = NULL;
   REG_UNLOCK();
   return first_err;
 }

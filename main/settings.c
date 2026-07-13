@@ -18,6 +18,7 @@ static const char *TAG = "settings";
 #define NVS_KEY_EQ_GAINS       "eq_gains"
 #define NVS_KEY_LED_BRIGHTNESS "led_bright"
 #define NVS_KEY_CHANNEL_MODE   "chan_mode"
+#define NVS_KEY_SUB_OFFSET     "sub_off"
 
 #define MAX_WIFI_SSID_LEN     32
 #define MAX_WIFI_PASSWORD_LEN 64
@@ -478,6 +479,52 @@ esp_err_t settings_set_channel_mode(uint8_t mode) {
     ESP_LOGI(TAG, "Saved channel mode: %d", mode);
   } else {
     ESP_LOGE(TAG, "Failed to save channel mode: %s", esp_err_to_name(err));
+  }
+  return err;
+}
+
+/* ================================================================== */
+/*  Sub level offset                                                   */
+/* ================================================================== */
+
+esp_err_t settings_get_sub_offset(float *offset_db) {
+  if (!offset_db) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+  if (err != ESP_OK) {
+    return ESP_ERR_NOT_FOUND;
+  }
+
+  int32_t fixed;
+  err = nvs_get_i32(nvs, NVS_KEY_SUB_OFFSET, &fixed);
+  nvs_close(nvs);
+  if (err == ESP_OK) {
+    *offset_db = (float)fixed / 100.0f;
+  }
+  return err;
+}
+
+esp_err_t settings_set_sub_offset(float offset_db) {
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  err = nvs_set_i32(nvs, NVS_KEY_SUB_OFFSET, (int32_t)(offset_db * 100.0f));
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs);
+  }
+  nvs_close(nvs);
+
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG, "Saved sub offset: %.1f dB", offset_db);
+  } else {
+    ESP_LOGE(TAG, "Failed to save sub offset: %s", esp_err_to_name(err));
   }
   return err;
 }

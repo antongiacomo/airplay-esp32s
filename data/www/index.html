@@ -74,7 +74,14 @@ input:focus{outline:none;border-color:#e94560}
 <option value='2'>Right only</option>
 <option value='3'>Mono (L+R)</option>
 </select></div>
-<div id='chan-msg'></div></div>
+<div id='chan-msg'></div>
+<div id='sub-group' style='display:none;margin-top:18px'>
+<div class='form-group'><label for='sub-level'>Sub Level</label>
+<div class='slider-row'><input type='range' id='sub-level' min='-15' max='15' step='1' value='0' oninput='document.getElementById("sub-db").textContent=(this.value>0?"+":"")+this.value+" dB"'>
+<span id='sub-db'>0 dB</span></div></div>
+<button class='btn btn-secondary' onclick='saveSub()'>Save Sub Level</button>
+<div id='sub-msg'></div></div>
+</div>
 <div class='card'><h2>Firmware Update</h2>
 <div class='file-row'><input type='file' id='fw-file' accept='.bin' style='display:none'>
 <button class='btn btn-secondary' onclick='document.getElementById("fw-file").click()'>Choose File</button>
@@ -143,6 +150,17 @@ async function saveChannel(){
   try{var r=await fetch('/api/audio/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:v})});
     var d=await r.json();if(d.success){msg('chan-msg','Saved!','ok');}else{msg('chan-msg',d.error,'err');}}
   catch(e){msg('chan-msg','Error','err');console.error('saveChannel failed',e);}}
+async function loadSub(){
+  try{var r=await fetch('/api/audio/sub');if(!r.ok)return;var d=await r.json();
+    if(d.success){var s=document.getElementById('sub-level');s.min=d.min;s.max=d.max;s.value=d.offset;
+      document.getElementById('sub-db').textContent=(d.offset>0?'+':'')+d.offset+' dB';
+      document.getElementById('sub-group').style.display='';}}
+  catch(e){console.warn('Could not load sub level',e);}}
+async function saveSub(){
+  var v=Number.parseFloat(document.getElementById('sub-level').value);
+  try{var r=await fetch('/api/audio/sub',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({offset:v})});
+    var d=await r.json();if(d.success){msg('sub-msg','Saved!','ok');}else{msg('sub-msg',d.error,'err');}}
+  catch(e){msg('sub-msg','Error','err');console.error('saveSub failed',e);}}
 async function saveName(){
   var n=document.getElementById('dev-name').value.trim();if(!n){msg('name-msg','Enter a name','err');return;}
   try{var r=await fetch('/api/device/name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});
@@ -179,5 +197,5 @@ window.onload=function(){
   document.getElementById('fw-file').onchange=function(e){var f=e.target.files[0];
     document.getElementById('fw-name').textContent=f?f.name:'No file selected';
     document.getElementById('ota-btn').disabled=!f;};
-  loadInfo();loadBrightness();loadChannel();setInterval(loadInfo,30000);};
+  loadInfo();loadBrightness();loadChannel();loadSub();setInterval(loadInfo,30000);};
 </script></body></html>

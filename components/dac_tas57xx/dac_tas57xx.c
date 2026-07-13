@@ -73,30 +73,49 @@ static const struct tas57xx_cmd_s tas57xx_cmd[] = {
     {0x03, 0x00}, // TAS57XX_UNMUTE (BA)
 };
 
-static uint8_t tas57xx_addr;
+#define TAS57XX_MAX_DEVICES 2
+
+typedef struct {
+  uint8_t addr;                   // 7-bit I2C address
+  i2c_master_dev_handle_t handle; // per-device I2C handle
+  uint8_t *hf_buf;                // cached hybrid flow (NULL if none)
+  long hf_size;
+  bool is_sub; // true for index > 0 (sub / .1 channel)
+} tas57xx_dev_t;
+
+static tas57xx_dev_t s_devs[TAS57XX_MAX_DEVICES];
+static int s_dev_count = 0;
 static i2c_master_bus_handle_t s_bus_handle = NULL;
-static i2c_master_dev_handle_t tas57xx_device_handle;
 static dac_power_mode_t s_power_state = DAC_POWER_OFF;
-static uint8_t *s_hf_buf = NULL; // Cached hybrid flow (TAS5754M only)
-static long s_hf_size = 0;
 static SemaphoreHandle_t s_dac_mutex = NULL;
 
-static esp_err_t write_cmd(tas57xx_cmd_e cmd, ...);
-static int tas57xx_detect(i2c_master_bus_handle_t s_bus_handle);
+// Sub level trim (dB) added to the master volume for sub devices, and the
+// cached master volume so the trim can be re-applied on its own.
+static float s_sub_offset_db = 0.0f;
+static float s_last_airplay_db = -15.0f;
+
+// Candidate TAS575x addresses (ADR strap 0x98/0x9A/0x9C/0x9E >> 1).
+// 0x4C is always treated as the mains (L/R) device at index 0.
+static const uint8_t tas575x_addrs[] = {TAS575x, 0x4D, 0x4E, 0x4F};
+
+static esp_err_t write_cmd(i2c_master_dev_handle_t handle, tas57xx_cmd_e cmd,
+                           ...);
+static int tas57xx_detect_all(i2c_master_bus_handle_t bus);
 
 /**
  * Write a hybrid flow configuration byte stream to the DAC.
  * Format: [reg, len, data[0..len-1], ...] terminated by 0xFF, 0xFF.
  * The HF config manages its own standby entry/exit.
  */
-static esp_err_t tas57xx_write_hf(const uint8_t *stream) {
+static esp_err_t tas57xx_write_hf(i2c_master_dev_handle_t handle,
+                                  const uint8_t *stream) {
   esp_err_t err;
   int pos = 0;
   while (!(stream[pos] == 0xFF && stream[pos + 1] == 0xFF)) {
     uint8_t reg = stream[pos];
     uint8_t len = stream[pos + 1];
     const uint8_t *data = &stream[pos + 2];
-    err = board_i2c_write(tas57xx_device_handle, reg, data, len);
+    err = board_i2c_write(handle, reg, data, len);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "HF write failed at offset %d (reg 0x%02X): %s", pos, reg,
                esp_err_to_name(err));
@@ -106,6 +125,66 @@ static esp_err_t tas57xx_write_hf(const uint8_t *stream) {
   }
   ESP_LOGI(TAG, "HybridFlow loaded");
   return ESP_OK;
+}
+
+// Load a hybrid-flow for device index i and program it.
+//   single device   -> /spiffs/hf/tas57xx_fw.bin   (legacy name)
+//   multiple devices -> /spiffs/hf/tas57xx_fw<i>.bin (mains=0, sub=1, ...)
+// A mains device (index 0) with no indexed file falls back to the legacy name.
+// A sub with no hybrid-flow runs in normal BTL stereo (no crossover).
+static void tas57xx_load_hf(int i, bool multi) {
+  tas57xx_dev_t *d = &s_devs[i];
+
+  // TAS578x has no miniDSP / hybrid-flow.
+  if (d->addr == TAS578x) {
+    return;
+  }
+
+  char path[48];
+  if (multi) {
+    snprintf(path, sizeof(path), "/spiffs/hf/tas57xx_fw%d.bin", i);
+  } else {
+    snprintf(path, sizeof(path), "/spiffs/hf/tas57xx_fw.bin");
+  }
+
+  FILE *f = fopen(path, "rb");
+  if (!f && multi && i == 0) {
+    // Mains falls back to the legacy unindexed name.
+    snprintf(path, sizeof(path), "/spiffs/hf/tas57xx_fw.bin");
+    f = fopen(path, "rb");
+  }
+
+  if (f) {
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *buf = malloc(size);
+    if (buf && fread(buf, 1, size, f) == (size_t)size) {
+      d->hf_buf = buf;
+      d->hf_size = size;
+      tas57xx_write_hf(d->handle, buf);
+      ESP_LOGI(TAG, "Loaded HF %s for @0x%02X", path, d->addr);
+    } else {
+      ESP_LOGE(TAG, "Failed to read HF file %s", path);
+      free(buf);
+    }
+    fclose(f);
+    if (d->hf_buf) {
+      return;
+    }
+  }
+
+  // No hybrid-flow present. The device runs in its normal (safe) BTL stereo
+  // configuration. A sub with no HF has no low-pass/mono routing, so it plays
+  // full-range — provide a mono low-pass flow as tas57xx_fw<i>.bin.
+  if (d->is_sub) {
+    ESP_LOGW(TAG,
+             "No HF for sub @0x%02X — running full-range BTL (no crossover). "
+             "Provide a mono low-pass flow as /spiffs/hf/tas57xx_fw%d.bin.",
+             d->addr, i);
+  } else {
+    ESP_LOGI(TAG, "No HF at %s, running default stereo", path);
+  }
 }
 
 static esp_err_t tas57xx_init(void *i2c_bus) {
@@ -124,69 +203,54 @@ static esp_err_t tas57xx_init(void *i2c_bus) {
     ESP_LOGE(TAG, "No I2C bus handle provided");
     return ESP_ERR_INVALID_ARG;
   }
-  // Detect TAS57xx chip
-  tas57xx_addr = tas57xx_detect(s_bus_handle);
 
-  if (!tas57xx_addr) {
+  // Detect all TAS57xx chips on the bus (0x4C = mains at index 0).
+  s_dev_count = tas57xx_detect_all(s_bus_handle);
+  if (s_dev_count == 0) {
     ESP_LOGW(TAG, "No TAS57xx detected");
     return ESP_ERR_NOT_FOUND;
   }
+  ESP_LOGI(TAG, "TAS57xx devices detected: %d", s_dev_count);
 
-  err = board_i2c_add_device(s_bus_handle, tas57xx_addr, I2C_LINE_SPEED,
-                             &tas57xx_device_handle);
-  if (ESP_OK != err) {
-    ESP_LOGE(TAG, "Could not add device to bus: %s", esp_err_to_name(err));
-    return err;
+  for (int i = 0; i < s_dev_count; i++) {
+    err = board_i2c_add_device(s_bus_handle, s_devs[i].addr, I2C_LINE_SPEED,
+                               &s_devs[i].handle);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Could not add device @0x%02X to bus: %s", s_devs[i].addr,
+               esp_err_to_name(err));
+      return err;
+    }
   }
 
-  // Read chip identity for feature availability
-  if (tas57xx_addr == TAS578x) {
+  // Read chip identity for the primary device.
+  if (s_devs[0].addr == TAS578x) {
     uint8_t page = 0x00;
-    board_i2c_write(tas57xx_device_handle, 0x00, &page, 1);
+    board_i2c_write(s_devs[0].handle, 0x00, &page, 1);
     uint8_t device_id = 0;
-    if (board_i2c_read(tas57xx_device_handle, TAS578x_REG_DEVICE_ID, &device_id,
+    if (board_i2c_read(s_devs[0].handle, TAS578x_REG_DEVICE_ID, &device_id,
                        1) == ESP_OK) {
       ESP_LOGI(TAG, "TAS578x device ID: 0x%02X", device_id);
     }
-  } else if (tas57xx_addr == TAS575x) {
+  } else {
     ESP_LOGI(TAG, "TAS575x detected (no device ID register)");
   }
 
-  // Load and cache hybrid flow from SPIFFS for TAS575x (TAS5754M with miniDSP)
-  static const char *hf_path = "/spiffs/hf/tas57xx_fw.bin";
-  if (tas57xx_addr == TAS575x) {
-    FILE *f = fopen(hf_path, "rb");
-    if (f) {
-      fseek(f, 0, SEEK_END);
-      long size = ftell(f);
-      fseek(f, 0, SEEK_SET);
-      uint8_t *buf = malloc(size);
-      if (buf && fread(buf, 1, size, f) == (size_t)size) {
-        s_hf_buf = buf;
-        s_hf_size = size;
-        err = tas57xx_write_hf(s_hf_buf);
-      } else {
-        ESP_LOGE(TAG, "Failed to read HF file %s", hf_path);
-        free(buf);
-        err = ESP_ERR_NO_MEM;
-      }
-      fclose(f);
-      if (err != ESP_OK) {
-        return err;
-      }
-    } else {
-      ESP_LOGI(TAG, "No HF file at %s, skipping", hf_path);
-    }
+  // Load hybrid-flows (or PBTL fallback for a sub) per device.
+  bool multi = s_dev_count > 1;
+  for (int i = 0; i < s_dev_count; i++) {
+    tas57xx_load_hf(i, multi);
   }
 
-  // Apply additional init registers
-  for (int i = 0; tas57xx_init_seq[i].reg != 0xff; i++) {
-    err = board_i2c_write(tas57xx_device_handle, tas57xx_init_seq[i].reg,
-                          &tas57xx_init_seq[i].value, sizeof(uint8_t));
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed to write init reg 0x%02x: %s",
-               tas57xx_init_seq[i].reg, esp_err_to_name(err));
-      return err;
+  // Apply additional init registers to every device.
+  for (int i = 0; i < s_dev_count; i++) {
+    for (int k = 0; tas57xx_init_seq[k].reg != 0xff; k++) {
+      err = board_i2c_write(s_devs[i].handle, tas57xx_init_seq[k].reg,
+                            &tas57xx_init_seq[k].value, sizeof(uint8_t));
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to write init reg 0x%02x @0x%02X: %s",
+                 tas57xx_init_seq[k].reg, s_devs[i].addr, esp_err_to_name(err));
+        return err;
+      }
     }
   }
 
@@ -196,48 +260,55 @@ static esp_err_t tas57xx_init(void *i2c_bus) {
 static esp_err_t tas57xx_deinit(void) {
   esp_err_t err = ESP_OK;
 
-  if (tas57xx_device_handle) {
-    err = board_i2c_remove_device(tas57xx_device_handle);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "failed to remove from i2c bus, err: %s",
-               esp_err_to_name(err));
+  for (int i = 0; i < s_dev_count; i++) {
+    if (s_devs[i].handle) {
+      esp_err_t e = board_i2c_remove_device(s_devs[i].handle);
+      if (e != ESP_OK) {
+        ESP_LOGE(TAG, "failed to remove @0x%02X from i2c bus, err: %s",
+                 s_devs[i].addr, esp_err_to_name(e));
+        err = e;
+      }
+      s_devs[i].handle = NULL;
     }
-    tas57xx_device_handle = NULL;
+    free(s_devs[i].hf_buf);
+    s_devs[i].hf_buf = NULL;
+    s_devs[i].hf_size = 0;
   }
-
+  s_dev_count = 0;
   s_bus_handle = NULL;
-  free(s_hf_buf);
-  s_hf_buf = NULL;
+
   if (s_dac_mutex != NULL) {
     vSemaphoreDelete(s_dac_mutex);
     s_dac_mutex = NULL;
   }
-  s_hf_size = 0;
   return err;
 }
 
 /**
- * Re-apply HF config and init registers after a full shutdown.
- * Shutdown (reg 0x02=0x01) loses miniDSP RAM contents.
+ * Re-apply HF config (or PBTL fallback) and init registers after a full
+ * shutdown. Shutdown (reg 0x02=0x01) loses miniDSP RAM contents.
  */
 static void tas57xx_restore_config(void) {
-  if (s_hf_buf) {
-    esp_err_t err = tas57xx_write_hf(s_hf_buf);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Failed to restore HF config: %s", esp_err_to_name(err));
+  for (int i = 0; i < s_dev_count; i++) {
+    tas57xx_dev_t *d = &s_devs[i];
+    if (d->hf_buf) {
+      esp_err_t err = tas57xx_write_hf(d->handle, d->hf_buf);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to restore HF @0x%02X: %s", d->addr,
+                 esp_err_to_name(err));
+      }
     }
-  }
-  for (int i = 0; tas57xx_init_seq[i].reg != 0xff; i++) {
-    board_i2c_write(tas57xx_device_handle, tas57xx_init_seq[i].reg,
-                    &tas57xx_init_seq[i].value, sizeof(uint8_t));
+    for (int k = 0; tas57xx_init_seq[k].reg != 0xff; k++) {
+      board_i2c_write(d->handle, tas57xx_init_seq[k].reg,
+                      &tas57xx_init_seq[k].value, sizeof(uint8_t));
+    }
   }
 }
 
 static void tas57xx_enable_speaker(bool enable) {
-  if (enable) {
-    write_cmd(TAS57XX_ANALOGUE_ON);
-  } else {
-    write_cmd(TAS57XX_ANALOGUE_OFF);
+  for (int i = 0; i < s_dev_count; i++) {
+    write_cmd(s_devs[i].handle,
+              enable ? TAS57XX_ANALOGUE_ON : TAS57XX_ANALOGUE_OFF);
   }
 }
 
@@ -246,8 +317,10 @@ static void tas57xx_set_power_mode(dac_power_mode_t mode) {
   tas57xx_enable_speaker(false);
   switch (mode) {
   case DAC_POWER_STANDBY:
-    write_cmd(TAS57XX_MUTE);
-    write_cmd(TAS57XX_STANDBY);
+    for (int i = 0; i < s_dev_count; i++) {
+      write_cmd(s_devs[i].handle, TAS57XX_MUTE);
+      write_cmd(s_devs[i].handle, TAS57XX_STANDBY);
+    }
     if (s_power_state == DAC_POWER_OFF) {
       // Wait for standby state to settle before writing miniDSP config
       vTaskDelay(pdMS_TO_TICKS(50));
@@ -255,16 +328,22 @@ static void tas57xx_set_power_mode(dac_power_mode_t mode) {
     }
     break;
   case DAC_POWER_ON:
-    write_cmd(TAS57XX_MUTE);
-    write_cmd(TAS57XX_ACTIVE);
+    for (int i = 0; i < s_dev_count; i++) {
+      write_cmd(s_devs[i].handle, TAS57XX_MUTE);
+      write_cmd(s_devs[i].handle, TAS57XX_ACTIVE);
+    }
     // Allow PLL lock and charge pump settling before unmuting
     vTaskDelay(pdMS_TO_TICKS(50));
-    write_cmd(TAS57XX_UNMUTE);
+    for (int i = 0; i < s_dev_count; i++) {
+      write_cmd(s_devs[i].handle, TAS57XX_UNMUTE);
+    }
     tas57xx_enable_speaker(true);
     break;
   case DAC_POWER_OFF:
-    write_cmd(TAS57XX_MUTE);
-    write_cmd(TAS57XX_DOWN);
+    for (int i = 0; i < s_dev_count; i++) {
+      write_cmd(s_devs[i].handle, TAS57XX_MUTE);
+      write_cmd(s_devs[i].handle, TAS57XX_DOWN);
+    }
     break;
   default:
     ESP_LOGW(TAG, "Unhandled power mode");
@@ -279,9 +358,8 @@ static void tas57xx_enable_line_out(bool enable) {
   ESP_LOGW(TAG, "Not supported yet");
 }
 
-static void tas57xx_set_volume(float volume_airplay_db) {
-  xSemaphoreTake(s_dac_mutex, portMAX_DELAY);
-  // Clamp AirPlay input range (-30 to 0)
+// Map an AirPlay volume (-30..0 dB) to a DAC dB level using the 2:1 curve.
+static float tas57xx_map_volume_db(float volume_airplay_db) {
   if (volume_airplay_db > 0.0f) {
     volume_airplay_db = 0.0f;
   }
@@ -297,33 +375,83 @@ static void tas57xx_set_volume(float volume_airplay_db) {
   float db_level;
   if (volume_airplay_db >= -25.0f) {
     // 2:1 linear scaling: 25 dB AirPlay range -> 50 dB DAC range
-    // AirPlay 0 -> MAX, AirPlay -25 -> MAX - 50
     db_level = max_db + (volume_airplay_db * 2.0f);
   } else {
     // Roll-off: map -30..-25 to -127..(MAX-50)
-    // normalized: 0 at -30, 1 at -25
     float normalized = (volume_airplay_db + 30.0f) / 5.0f;
     float rolloff_top = max_db - 50.0f;
     db_level = -127.0f + normalized * (127.0f + rolloff_top);
   }
+  return db_level;
+}
 
-  // Clamp to DAC valid range
+// Convert a DAC dB level to a register value (0x00=0dB, 0xFE=-127dB).
+static uint8_t tas57xx_db_to_reg(float db_level) {
   if (db_level > 0.0f) {
     db_level = 0.0f;
   }
   if (db_level < -127.0f) {
     db_level = -127.0f;
   }
+  return (uint8_t)(-db_level * 2.0f);
+}
 
-  // Convert dB to DAC register: reg = -dB * 2 (0x00=0dB, 0xFE=-127dB)
-  uint8_t reg_val = (uint8_t)(-db_level * 2.0f);
+// Re-apply the cached master volume to every device, adding the sub offset to
+// any sub device. Caller must hold s_dac_mutex.
+static void tas57xx_apply_volume_locked(void) {
+  float base_db = tas57xx_map_volume_db(s_last_airplay_db);
+  uint8_t main_reg = tas57xx_db_to_reg(base_db);
+  uint8_t sub_reg = tas57xx_db_to_reg(base_db + s_sub_offset_db);
 
-  ESP_LOGD(TAG, "Volume: AirPlay %.1f dB -> DAC %.1f dB -> reg 0x%02X",
-           volume_airplay_db, db_level, reg_val);
+  ESP_LOGD(TAG,
+           "Volume: AirPlay %.1f dB -> DAC %.1f dB (main 0x%02X, sub %+.1f dB "
+           "0x%02X)",
+           s_last_airplay_db, base_db, main_reg, s_sub_offset_db, sub_reg);
 
-  write_cmd(TAS57XX_SET_VOLUME_A_L, reg_val);
-  write_cmd(TAS57XX_SET_VOLUME_B_R, reg_val);
+  for (int i = 0; i < s_dev_count; i++) {
+    uint8_t reg_val = s_devs[i].is_sub ? sub_reg : main_reg;
+    write_cmd(s_devs[i].handle, TAS57XX_SET_VOLUME_A_L, reg_val);
+    write_cmd(s_devs[i].handle, TAS57XX_SET_VOLUME_B_R, reg_val);
+  }
+}
+
+static void tas57xx_set_volume(float volume_airplay_db) {
+  xSemaphoreTake(s_dac_mutex, portMAX_DELAY);
+  if (volume_airplay_db > 0.0f) {
+    volume_airplay_db = 0.0f;
+  }
+  if (volume_airplay_db < -30.0f) {
+    volume_airplay_db = -30.0f;
+  }
+  s_last_airplay_db = volume_airplay_db;
+  tas57xx_apply_volume_locked();
   xSemaphoreGive(s_dac_mutex);
+}
+
+void dac_tas57xx_set_sub_offset_db(float offset_db) {
+  if (offset_db > TAS57XX_SUB_OFFSET_MAX_DB) {
+    offset_db = TAS57XX_SUB_OFFSET_MAX_DB;
+  }
+  if (offset_db < TAS57XX_SUB_OFFSET_MIN_DB) {
+    offset_db = TAS57XX_SUB_OFFSET_MIN_DB;
+  }
+
+  // May be called (e.g. from the web server) before the DAC is initialised;
+  // store the value and let the next volume update apply it.
+  if (s_dac_mutex == NULL) {
+    s_sub_offset_db = offset_db;
+    return;
+  }
+
+  xSemaphoreTake(s_dac_mutex, portMAX_DELAY);
+  s_sub_offset_db = offset_db;
+  tas57xx_apply_volume_locked();
+  xSemaphoreGive(s_dac_mutex);
+  ESP_LOGI(TAG, "Sub volume offset: %+.1f dB", offset_db);
+}
+
+float dac_tas57xx_get_sub_offset_db(void) {
+  return s_sub_offset_db;
 }
 
 const dac_ops_t dac_tas57xx_ops = {
@@ -335,7 +463,8 @@ const dac_ops_t dac_tas57xx_ops = {
     .enable_line_out = tas57xx_enable_line_out,
 };
 
-static esp_err_t write_cmd(tas57xx_cmd_e cmd, ...) {
+static esp_err_t write_cmd(i2c_master_dev_handle_t handle, tas57xx_cmd_e cmd,
+                           ...) {
   va_list args;
   esp_err_t err = ESP_OK;
   va_start(args, cmd);
@@ -344,11 +473,10 @@ static esp_err_t write_cmd(tas57xx_cmd_e cmd, ...) {
   case TAS57XX_SET_VOLUME_A_L:
   case TAS57XX_SET_VOLUME_B_R:
     uint8_t val = (uint8_t)va_arg(args, int);
-    err = board_i2c_write(tas57xx_device_handle, tas57xx_cmd[cmd].reg, &val,
-                          sizeof(uint8_t));
+    err = board_i2c_write(handle, tas57xx_cmd[cmd].reg, &val, sizeof(uint8_t));
     break;
   default:
-    err = board_i2c_write(tas57xx_device_handle, tas57xx_cmd[cmd].reg,
+    err = board_i2c_write(handle, tas57xx_cmd[cmd].reg,
                           &(tas57xx_cmd[cmd].value), sizeof(uint8_t));
   }
 
@@ -361,21 +489,36 @@ static esp_err_t write_cmd(tas57xx_cmd_e cmd, ...) {
 }
 
 /**
- * Find a known chip ID on the I2C bus
+ * Detect all TAS57xx chips on the bus and populate s_devs[].
+ * A single TAS578x is supported for legacy boards; otherwise every responding
+ * TAS575x address (0x4C..0x4F) is added, with 0x4C as the mains at index 0.
+ * Returns the number of devices found.
  */
-static int tas57xx_detect(i2c_master_bus_handle_t s_bus_handle) {
-  uint8_t supported_chips[] = {TAS578x, TAS575x};
-  if (!s_bus_handle) {
+static int tas57xx_detect_all(i2c_master_bus_handle_t bus) {
+  if (!bus) {
     ESP_LOGE(TAG, "Invalid i2c handle!");
-    return -1;
+    return 0;
   }
 
-  for (int i = 0; i < sizeof(supported_chips); i++) {
-    if (ESP_OK ==
-        i2c_master_probe(s_bus_handle, supported_chips[i], I2C_TIMEOUT)) {
-      ESP_LOGI(TAG, "Detected TAS57xx at @0x%x", supported_chips[i]);
-      return supported_chips[i];
+  memset(s_devs, 0, sizeof(s_devs));
+
+  // Legacy single TAS578x.
+  if (i2c_master_probe(bus, TAS578x, I2C_TIMEOUT) == ESP_OK) {
+    s_devs[0].addr = TAS578x;
+    ESP_LOGI(TAG, "Detected TAS578x @0x%02X", TAS578x);
+    return 1;
+  }
+
+  int count = 0;
+  for (size_t i = 0; i < sizeof(tas575x_addrs) && count < TAS57XX_MAX_DEVICES;
+       i++) {
+    if (i2c_master_probe(bus, tas575x_addrs[i], I2C_TIMEOUT) == ESP_OK) {
+      s_devs[count].addr = tas575x_addrs[i];
+      s_devs[count].is_sub = (count > 0);
+      ESP_LOGI(TAG, "Detected TAS575x @0x%02X (%s)", tas575x_addrs[i],
+               count == 0 ? "mains" : "sub");
+      count++;
     }
   }
-  return 0;
+  return count;
 }

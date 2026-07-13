@@ -23,6 +23,14 @@
 #include "rtsp_events.h"
 #endif
 
+#ifdef CONFIG_DAC_TAS57XX
+#include "dac_tas57xx.h"
+#endif
+
+#ifdef CONFIG_DAC_TAS58XX
+#include "dac_tas58xx.h"
+#endif
+
 #include "iot_board.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -197,6 +205,19 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(ret);
   ESP_ERROR_CHECK(settings_init());
+#ifdef CONFIG_DAC_TAS57XX
+  // Load persisted sub level offset (pre-init safe; applied on first volume).
+  float sub_off;
+  if (settings_get_sub_offset(&sub_off) == ESP_OK) {
+    dac_tas57xx_set_sub_offset_db(sub_off);
+  }
+#elif defined(CONFIG_DAC_TAS58XX)
+  // Load persisted sub level offset (pre-init safe; applied on first volume).
+  float sub_off;
+  if (settings_get_sub_offset(&sub_off) == ESP_OK) {
+    dac_tas58xx_set_sub_offset_db(sub_off);
+  }
+#endif
   spiffs_storage_init();
   log_stream_init();
   ESP_ERROR_CHECK(playback_control_init());

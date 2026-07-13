@@ -153,3 +153,17 @@ esp_err_t settings_get_channel_mode(uint8_t *mode);
  * @param mode audio_channel_mode_t value
  */
 esp_err_t settings_set_channel_mode(uint8_t mode);
+
+// ---- Sub level offset ----
+
+/**
+ * Get saved sub level offset in dB (relative to master volume).
+ * @param offset_db Output: offset in dB
+ * @return ESP_OK if found, error otherwise
+ */
+esp_err_t settings_get_sub_offset(float *offset_db);
+
+/**
+ * Save sub level offset (dB) to persistent storage.
+ */
+esp_err_t settings_set_sub_offset(float offset_db);

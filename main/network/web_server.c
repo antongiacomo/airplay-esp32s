@@ -26,7 +26,29 @@
 
 #ifdef CONFIG_DAC_TAS58XX
 #include "eq_events.h"
+#include "dac_tas58xx.h"
 #include "dac_tas58xx_eq.h"
+#endif
+
+#ifdef CONFIG_DAC_TAS57XX
+#include "dac_tas57xx.h"
+#endif
+
+/* Sub level-trim (2.1 subwoofer) is exposed by both the TAS57xx and TAS58xx
+ * drivers with the same API shape. Map to whichever is configured so the
+ * /api/audio/sub endpoints work regardless of DAC. */
+#if defined(CONFIG_DAC_TAS57XX)
+#define DAC_HAS_SUB_OFFSET       1
+#define DAC_SUB_OFFSET_MIN_DB    TAS57XX_SUB_OFFSET_MIN_DB
+#define DAC_SUB_OFFSET_MAX_DB    TAS57XX_SUB_OFFSET_MAX_DB
+#define dac_get_sub_offset_db()  dac_tas57xx_get_sub_offset_db()
+#define dac_set_sub_offset_db(x) dac_tas57xx_set_sub_offset_db(x)
+#elif defined(CONFIG_DAC_TAS58XX)
+#define DAC_HAS_SUB_OFFSET       1
+#define DAC_SUB_OFFSET_MIN_DB    TAS58XX_SUB_OFFSET_MIN_DB
+#define DAC_SUB_OFFSET_MAX_DB    TAS58XX_SUB_OFFSET_MAX_DB
+#define dac_get_sub_offset_db()  dac_tas58xx_get_sub_offset_db()
+#define dac_set_sub_offset_db(x) dac_tas58xx_set_sub_offset_db(x)
 #endif
 
 static const char *TAG = "web_server";
@@ -419,6 +441,64 @@ static esp_err_t channel_mode_post_handler(httpd_req_t *req) {
   cJSON_Delete(response);
   return ESP_OK;
 }
+
+#ifdef DAC_HAS_SUB_OFFSET
+static esp_err_t sub_offset_get_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddNumberToObject(json, "offset", dac_get_sub_offset_db());
+  cJSON_AddNumberToObject(json, "min", DAC_SUB_OFFSET_MIN_DB);
+  cJSON_AddNumberToObject(json, "max", DAC_SUB_OFFSET_MAX_DB);
+  cJSON_AddBoolToObject(json, "success", true);
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+static esp_err_t sub_offset_post_handler(httpd_req_t *req) {
+  char content[64];
+  int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+  if (ret <= 0) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+  content[ret] = '\0';
+
+  cJSON *json = cJSON_Parse(content);
+  if (!json) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    return ESP_FAIL;
+  }
+
+  cJSON *response = cJSON_CreateObject();
+  cJSON *val = cJSON_GetObjectItem(json, "offset");
+  if (val && cJSON_IsNumber(val)) {
+    float off = (float)val->valuedouble;
+    if (off < DAC_SUB_OFFSET_MIN_DB) {
+      off = DAC_SUB_OFFSET_MIN_DB;
+    }
+    if (off > DAC_SUB_OFFSET_MAX_DB) {
+      off = DAC_SUB_OFFSET_MAX_DB;
+    }
+    dac_set_sub_offset_db(off);
+    settings_set_sub_offset(off);
+    cJSON_AddBoolToObject(response, "success", true);
+  } else {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Expected {\"offset\": dB}");
+  }
+
+  char *json_str = cJSON_Print(response);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  cJSON_Delete(response);
+  return ESP_OK;
+}
+#endif /* DAC_HAS_SUB_OFFSET */
 
 static esp_err_t ota_update_handler(httpd_req_t *req) {
   if (req->content_len == 0) {
@@ -815,6 +895,9 @@ esp_err_t web_server_start(uint16_t port) {
   config.lru_purge_enable = true; // Reclaim stale sockets when all are in use
   config.max_uri_handlers =
       30; // Room for captive portal + EQ + speedtest + brightness + channel
+#ifdef CONFIG_DAC_TAS57XX
+  config.max_uri_handlers += 2; // sub level get/post
+#endif
   config.max_resp_headers = 8;
   config.stack_size = 8192;
 
@@ -892,6 +975,18 @@ esp_err_t web_server_start(uint16_t port) {
                                        .method = HTTP_POST,
                                        .handler = channel_mode_post_handler};
   httpd_register_uri_handler(s_server, &channel_mode_post_uri);
+
+#ifdef DAC_HAS_SUB_OFFSET
+  httpd_uri_t sub_offset_get_uri = {.uri = "/api/audio/sub",
+                                    .method = HTTP_GET,
+                                    .handler = sub_offset_get_handler};
+  httpd_register_uri_handler(s_server, &sub_offset_get_uri);
+
+  httpd_uri_t sub_offset_post_uri = {.uri = "/api/audio/sub",
+                                     .method = HTTP_POST,
+                                     .handler = sub_offset_post_handler};
+  httpd_register_uri_handler(s_server, &sub_offset_post_uri);
+#endif
 
   httpd_uri_t ota_uri = {.uri = "/api/ota/update",
                          .method = HTTP_POST,
